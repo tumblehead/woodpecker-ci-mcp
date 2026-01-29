@@ -398,9 +398,9 @@ impl WoodpeckerMcpServer {
         &self,
         Parameters(req): Parameters<GetStepLogsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let logs: Vec<LogEntry> = self
+        let logs: Option<Vec<LogEntry>> = self
             .client
-            .get(&format!(
+            .get_optional(&format!(
                 "/repos/{}/logs/{}/{}",
                 req.repo_id, req.pipeline_number, req.step_id
             ))
@@ -408,6 +408,7 @@ impl WoodpeckerMcpServer {
             .map_err(|e| e.into_mcp_error())?;
 
         let formatted: String = logs
+            .unwrap_or_default()
             .iter()
             .filter_map(|entry| entry.out.as_ref())
             .cloned()

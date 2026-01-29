@@ -92,6 +92,37 @@ impl WoodpeckerClient {
         self.handle_response(response).await
     }
 
+    /// GET request that may return null (treated as None)
+    pub async fn get_optional<T: DeserializeOwned>(&self, endpoint: &str) -> Result<Option<T>> {
+        let response = self
+            .authorize(self.client.get(self.url(endpoint)))
+            .send()
+            .await
+            .map_err(WoodpeckerError::HttpError)?;
+
+        let status = response.status().as_u16();
+
+        if status >= 200 && status < 300 {
+            let body = response.text().await.map_err(WoodpeckerError::HttpError)?;
+            if body.trim() == "null" || body.trim().is_empty() {
+                Ok(None)
+            } else {
+                serde_json::from_str(&body)
+                    .map(Some)
+                    .map_err(|e| {
+                        WoodpeckerError::Other(format!(
+                            "Failed to parse response: {}. Body: {}",
+                            e,
+                            if body.len() > 500 { &body[..500] } else { &body }
+                        ))
+                    })
+            }
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(WoodpeckerError::from_response(status, body))
+        }
+    }
+
     /// GET request with query parameters
     pub async fn get_with_query<T: DeserializeOwned, Q: Serialize>(
         &self,
