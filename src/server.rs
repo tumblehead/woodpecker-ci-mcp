@@ -101,8 +101,16 @@ pub struct GetStepLogsRequest {
     pub repo_id: i64,
     #[schemars(description = "Pipeline number")]
     pub pipeline_number: i64,
-    #[schemars(description = "Step ID to get logs for")]
+    #[schemars(description = "Step ID to get logs for (use list_pipeline_steps to find step IDs)")]
     pub step_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListStepsRequest {
+    #[schemars(description = "Repository ID")]
+    pub repo_id: i64,
+    #[schemars(description = "Pipeline number")]
+    pub pipeline_number: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -393,6 +401,53 @@ impl WoodpeckerMcpServer {
 
     // ===== Log Tools =====
 
+    #[tool(description = "List all steps in a pipeline with their IDs, states, and names - useful for finding the correct step_id for get_step_logs")]
+    async fn list_pipeline_steps(
+        &self,
+        Parameters(req): Parameters<ListStepsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let pipeline: Pipeline = self
+            .client
+            .get(&format!(
+                "/repos/{}/pipelines/{}",
+                req.repo_id, req.pipeline_number
+            ))
+            .await
+            .map_err(|e| e.into_mcp_error())?;
+
+        let mut output = String::new();
+        output.push_str(&format!("Pipeline #{} Steps:\n\n", pipeline.number));
+
+        if let Some(workflows) = pipeline.workflows {
+            for workflow in workflows {
+                output.push_str(&format!(
+                    "Workflow: {} (state: {})\n",
+                    workflow.name,
+                    workflow.state.as_deref().unwrap_or("unknown")
+                ));
+
+                if let Some(steps) = workflow.children {
+                    for step in steps {
+                        output.push_str(&format!(
+                            "  - Step ID: {} | Name: {} | State: {} | Exit: {}\n",
+                            step.id,
+                            step.name,
+                            step.state.as_deref().unwrap_or("unknown"),
+                            step.exit_code
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "-".to_string())
+                        ));
+                    }
+                }
+                output.push('\n');
+            }
+        } else {
+            output.push_str("No workflows found in this pipeline.\n");
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
     #[tool(description = "Get the execution logs for a specific pipeline step")]
     async fn get_step_logs(
         &self,
@@ -407,20 +462,30 @@ impl WoodpeckerMcpServer {
             .await
             .map_err(|e| e.into_mcp_error())?;
 
-        let formatted: String = logs
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|entry| entry.out.as_ref())
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("");
+        match logs {
+            Some(entries) if !entries.is_empty() => {
+                let formatted: String = entries
+                    .iter()
+                    .filter_map(|entry| entry.out.as_ref())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("");
 
-        if formatted.is_empty() {
-            Ok(CallToolResult::success(vec![Content::text(
-                "No logs available for this step",
-            )]))
-        } else {
-            Ok(CallToolResult::success(vec![Content::text(formatted)]))
+                if formatted.is_empty() {
+                    Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Logs contain {} entries but no output text. Step may still be running or logs are binary.",
+                        entries.len()
+                    ))]))
+                } else {
+                    Ok(CallToolResult::success(vec![Content::text(formatted)]))
+                }
+            }
+            Some(_) => Ok(CallToolResult::success(vec![Content::text(
+                "Step has no log entries. It may have been skipped or not yet run.",
+            )])),
+            None => Ok(CallToolResult::success(vec![Content::text(
+                "No logs found for this step. Verify the step_id exists in the pipeline (use list_pipeline_steps to find valid IDs).",
+            )])),
         }
     }
 
