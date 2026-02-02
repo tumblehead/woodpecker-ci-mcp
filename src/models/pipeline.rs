@@ -168,6 +168,9 @@ pub struct PipelineFilter {
 /// Log entry
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogEntry {
+    /// Log entry ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
     /// Step ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step_id: Option<i64>,
@@ -177,13 +180,10 @@ pub struct LogEntry {
     /// Timestamp
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<i64>,
-    /// Log output
+    /// Log data (base64 encoded bytes)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub out: Option<String>,
-    /// Log position
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pos: Option<i64>,
-    /// Log type
+    pub data: Option<String>,
+    /// Log type (0=stdout, 1=stderr, 2=exit_code, 3=metadata, 4=progress)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "type")]
     pub log_type: Option<i32>,

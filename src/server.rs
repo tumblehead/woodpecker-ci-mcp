@@ -464,17 +464,35 @@ impl WoodpeckerMcpServer {
 
         match logs {
             Some(entries) if !entries.is_empty() => {
+                // The data field contains base64-encoded bytes, decode them
                 let formatted: String = entries
                     .iter()
-                    .filter_map(|entry| entry.out.as_ref())
-                    .cloned()
+                    .filter_map(|entry| {
+                        entry.data.as_ref().and_then(|d| {
+                            // Try base64 decode first, fall back to direct string
+                            use base64::Engine;
+                            base64::engine::general_purpose::STANDARD
+                                .decode(d)
+                                .ok()
+                                .and_then(|bytes| String::from_utf8(bytes).ok())
+                                .or_else(|| Some(d.clone()))
+                        })
+                    })
                     .collect::<Vec<_>>()
                     .join("");
 
                 if formatted.is_empty() {
+                    // Debug: show first few entries to understand the structure
+                    let sample: String = entries
+                        .iter()
+                        .take(3)
+                        .map(|e| format!("{:?}", e))
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Logs contain {} entries but no output text. Step may still be running or logs are binary.",
-                        entries.len()
+                        "Logs contain {} entries but no output text.\n\nSample entries:\n{}",
+                        entries.len(),
+                        sample
                     ))]))
                 } else {
                     Ok(CallToolResult::success(vec![Content::text(formatted)]))
