@@ -1,8 +1,7 @@
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, ErrorCode, ErrorData as McpError, Implementation, ProtocolVersion,
-        ServerCapabilities, ServerInfo,
+        CallToolResult, Content, ErrorCode, ErrorData as McpError, ServerCapabilities, ServerInfo,
     },
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
@@ -621,15 +620,10 @@ impl WoodpeckerMcpServer {
 #[tool_handler]
 impl ServerHandler for WoodpeckerMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(
                 "Woodpecker CI MCP Server - Interact with Woodpecker CI pipelines, \
-                 repositories, secrets, and more."
-                    .to_string(),
-            ),
-        }
+                 repositories, secrets, and more.",
+            )
     }
 }
