@@ -1,0 +1,45 @@
+when:
+  - event: tag
+    ref: "refs/tags/v*"
+
+depends_on:
+  - check
+
+labels:
+  platform: darwin/amd64
+
+skip_clone: true
+
+steps:
+  - name: build
+    image: bash
+    environment:
+      GITEA_TOKEN:
+        from_secret: gitea_token
+    commands:
+      # Manual clone
+      - git init
+      - git remote add origin ${CI_REPO_CLONE_URL}
+      - git fetch --no-tags --depth=1 origin ${CI_COMMIT_SHA}
+      - git reset --hard ${CI_COMMIT_SHA}
+      - rustup default stable
+      - rustup target add aarch64-apple-darwin
+      - cargo build --release --target x86_64-apple-darwin
+      - cargo build --release --target aarch64-apple-darwin
+      # Upload to Gitea release
+      - >-
+        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/') &&
+        ARTIFACT="woodpecker-ci-mcp-v$VERSION-darwin-universal" &&
+        mkdir -p artifacts &&
+        lipo -create -output artifacts/$ARTIFACT
+        target/x86_64-apple-darwin/release/woodpecker-ci-mcp
+        target/aarch64-apple-darwin/release/woodpecker-ci-mcp &&
+        curl -sf -X POST "${CI_FORGE_URL}/api/v1/repos/${CI_REPO}/releases"
+        -H "Authorization: token $GITEA_TOKEN"
+        -H "Content-Type: application/json"
+        -d "{\"tag_name\":\"${CI_COMMIT_TAG}\",\"name\":\"${CI_COMMIT_TAG}\"}" || true &&
+        RELEASE_ID=$(curl -sf "${CI_FORGE_URL}/api/v1/repos/${CI_REPO}/releases/tags/${CI_COMMIT_TAG}"
+        -H "Authorization: token $GITEA_TOKEN" | sed 's/{"id":\([0-9]*\).*/\1/') &&
+        curl -sf -X POST "${CI_FORGE_URL}/api/v1/repos/${CI_REPO}/releases/$RELEASE_ID/assets?name=$ARTIFACT"
+        -H "Authorization: token $GITEA_TOKEN"
+        -F "attachment=@artifacts/$ARTIFACT"
