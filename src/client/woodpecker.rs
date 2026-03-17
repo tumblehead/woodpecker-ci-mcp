@@ -42,7 +42,7 @@ impl WoodpeckerClient {
     async fn handle_response<T: DeserializeOwned>(&self, response: Response) -> Result<T> {
         let status = response.status().as_u16();
 
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             let body = response.text().await.map_err(WoodpeckerError::HttpError)?;
             serde_json::from_str(&body).map_err(|e| {
                 WoodpeckerError::Other(format!(
@@ -61,7 +61,7 @@ impl WoodpeckerClient {
     async fn handle_text_response(&self, response: Response) -> Result<String> {
         let status = response.status().as_u16();
 
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             response.text().await.map_err(WoodpeckerError::HttpError)
         } else {
             let body = response.text().await.unwrap_or_default();
@@ -73,7 +73,7 @@ impl WoodpeckerClient {
     async fn handle_empty_response(&self, response: Response) -> Result<()> {
         let status = response.status().as_u16();
 
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             Ok(())
         } else {
             let body = response.text().await.unwrap_or_default();
@@ -102,7 +102,7 @@ impl WoodpeckerClient {
 
         let status = response.status().as_u16();
 
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             let body = response.text().await.map_err(WoodpeckerError::HttpError)?;
             if body.trim() == "null" || body.trim().is_empty() {
                 Ok(None)
