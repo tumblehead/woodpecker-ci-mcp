@@ -68,13 +68,19 @@ mod tests {
 
     #[test]
     fn test_trailing_slash_removed() {
-        env::set_var("WOODPECKER_SERVER", "https://ci.example.com/");
-        env::set_var("WOODPECKER_TOKEN", "test-token");
+        // SAFETY: test runs single-threaded; no other thread reads these env vars
+        unsafe {
+            env::set_var("WOODPECKER_SERVER", "https://ci.example.com/");
+            env::set_var("WOODPECKER_TOKEN", "test-token");
+        }
 
         let config = Config::from_env().unwrap();
         assert_eq!(config.server_url, "https://ci.example.com");
 
-        env::remove_var("WOODPECKER_SERVER");
-        env::remove_var("WOODPECKER_TOKEN");
+        // SAFETY: test cleanup, single-threaded
+        unsafe {
+            env::remove_var("WOODPECKER_SERVER");
+            env::remove_var("WOODPECKER_TOKEN");
+        }
     }
 }
