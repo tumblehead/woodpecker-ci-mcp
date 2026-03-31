@@ -102,6 +102,22 @@ pub struct GetStepLogsRequest {
     pub pipeline_number: i64,
     #[schemars(description = "Step ID to get logs for (use list_pipeline_steps to find step IDs)")]
     pub step_id: i64,
+    #[schemars(
+        description = "Number of lines to return. Combined with 'head': if head is true, returns this many lines from the start; otherwise from the end (tail). Ignored if offset or limit is set."
+    )]
+    pub lines: Option<usize>,
+    #[schemars(
+        description = "If true, return lines from the start of the log. If false or omitted, return lines from the end (tail). Only used with the 'lines' parameter."
+    )]
+    pub head: Option<bool>,
+    #[schemars(
+        description = "Zero-based line offset for pagination. When set, enables pagination mode (ignores 'lines' and 'head' parameters)."
+    )]
+    pub offset: Option<usize>,
+    #[schemars(
+        description = "Maximum number of lines to return for pagination. Defaults to 100 when offset is set. When set, enables pagination mode (ignores 'lines' and 'head' parameters)."
+    )]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -447,7 +463,9 @@ impl WoodpeckerMcpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Get the execution logs for a specific pipeline step")]
+    #[tool(
+        description = "Get the execution logs for a specific pipeline step. Supports head/tail (lines + head params) and pagination (offset + limit params). By default returns all lines. Output includes line numbers and metadata about the total log size."
+    )]
     async fn get_step_logs(
         &self,
         Parameters(req): Parameters<GetStepLogsRequest>,
@@ -463,39 +481,78 @@ impl WoodpeckerMcpServer {
 
         match logs {
             Some(entries) if !entries.is_empty() => {
-                // The data field contains base64-encoded bytes, decode them
-                let formatted: String = entries
+                use base64::Engine;
+
+                // Decode entries into (line_number, text) pairs
+                let decoded_lines: Vec<(usize, String)> = entries
                     .iter()
-                    .filter_map(|entry| {
-                        entry.data.as_ref().and_then(|d| {
-                            // Try base64 decode first, fall back to direct string
-                            use base64::Engine;
-                            base64::engine::general_purpose::STANDARD
+                    .enumerate()
+                    .filter_map(|(i, entry)| {
+                        entry.data.as_ref().map(|d| {
+                            let text = base64::engine::general_purpose::STANDARD
                                 .decode(d)
                                 .ok()
                                 .and_then(|bytes| String::from_utf8(bytes).ok())
-                                .or_else(|| Some(d.clone()))
+                                .unwrap_or_else(|| d.clone());
+                            let line_num = entry.line.map(|l| l as usize).unwrap_or(i);
+                            (line_num, text)
                         })
                     })
-                    .collect::<Vec<_>>()
-                    .join("");
+                    .collect();
 
-                if formatted.is_empty() {
-                    // Debug: show first few entries to understand the structure
+                let total = decoded_lines.len();
+
+                if total == 0 {
                     let sample: String = entries
                         .iter()
                         .take(3)
                         .map(|e| format!("{:?}", e))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
                         "Logs contain {} entries but no output text.\n\nSample entries:\n{}",
                         entries.len(),
                         sample
-                    ))]))
-                } else {
-                    Ok(CallToolResult::success(vec![Content::text(formatted)]))
+                    ))]));
                 }
+
+                // Determine slice based on parameters
+                // Pagination mode (offset/limit) takes priority over head/tail mode (lines/head)
+                let slice: &[(usize, String)] =
+                    if req.offset.is_some() || req.limit.is_some() {
+                        let offset = req.offset.unwrap_or(0).min(total);
+                        let limit = req.limit.unwrap_or(100);
+                        let end = total.min(offset + limit);
+                        &decoded_lines[offset..end]
+                    } else if let Some(n) = req.lines {
+                        if req.head.unwrap_or(false) {
+                            &decoded_lines[..total.min(n)]
+                        } else {
+                            &decoded_lines[total.saturating_sub(n)..]
+                        }
+                    } else {
+                        &decoded_lines[..]
+                    };
+
+                // Format with metadata header and line numbers
+                let header = if slice.len() < total {
+                    let first = slice.first().map(|(n, _)| *n).unwrap_or(0);
+                    let last = slice.last().map(|(n, _)| *n).unwrap_or(0);
+                    format!("[Log lines {}-{} of {} total]\n\n", first, last, total)
+                } else {
+                    format!("[{} log lines total]\n\n", total)
+                };
+
+                let body: String = slice
+                    .iter()
+                    .map(|(num, text)| format!("{}: {}", num, text))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{}{}",
+                    header, body
+                ))]))
             }
             Some(_) => Ok(CallToolResult::success(vec![Content::text(
                 "Step has no log entries. It may have been skipped or not yet run.",
