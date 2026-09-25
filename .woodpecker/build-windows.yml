@@ -30,9 +30,6 @@ steps:
       - >-
         $VERSION = (Select-String -Path Cargo.toml -Pattern '^version' | Select-Object -First 1).Line -replace '.*"(.*)".*','$1';
         $ARTIFACT = "woodpecker-ci-mcp-v$VERSION-windows-x86_64.exe";
-        New-Item -ItemType Directory -Force -Path artifacts;
+        New-Item -ItemType Directory -Force -Path artifacts | Out-Null;
         Copy-Item target\release\woodpecker-ci-mcp.exe "artifacts\$ARTIFACT";
-        $headers = @{ "Authorization" = "token $env:GITEA_TOKEN" };
-        try { Invoke-RestMethod -Method Post -Uri "$env:CI_FORGE_URL/api/v1/repos/$env:CI_REPO/releases" -Headers ($headers + @{ "Content-Type" = "application/json" }) -Body "{`"tag_name`":`"$env:CI_COMMIT_TAG`",`"name`":`"$env:CI_COMMIT_TAG`"}" } catch {};
-        $release = Invoke-RestMethod -Uri "$env:CI_FORGE_URL/api/v1/repos/$env:CI_REPO/releases/tags/$env:CI_COMMIT_TAG" -Headers $headers;
-        Invoke-RestMethod -Method Post -Uri "$env:CI_FORGE_URL/api/v1/repos/$env:CI_REPO/releases/$($release.id)/assets?name=$ARTIFACT" -Headers $headers -InFile "artifacts\$ARTIFACT" -ContentType "application/octet-stream"
+        powershell -NoProfile -ExecutionPolicy Bypass -File scripts\upload-release-asset.ps1 "artifacts\$ARTIFACT"

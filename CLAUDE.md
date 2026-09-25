@@ -35,6 +35,8 @@ cargo test
 ```
 
 CI (`.woodpecker/`) runs only on `v*` tags: it runs the check, then builds and uploads
-release binaries to Gitea. The tumbletrove plugin's bootstrap downloads these binaries by
+release binaries to Gitea through `scripts/upload-release-asset.{sh,ps1}`. The upload logic
+lives in those scripts because Woodpecker does not rewrite `$` variables in script files, and
+the scripts report Gitea's status and response body when a request fails. The tumbletrove plugin's bootstrap downloads these binaries by
 exact name (`woodpecker-ci-mcp-v<version>-{linux-x86_64,darwin-universal,windows-x86_64.exe}`),
 so do not rename artifacts without updating the plugin. Keep CHANGELOG.md up to date under `[Unreleased]`.
