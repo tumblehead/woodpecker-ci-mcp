@@ -23,7 +23,7 @@ steps:
       - git fetch --no-tags --depth=1 origin ${CI_COMMIT_SHA}
       - git reset --hard ${CI_COMMIT_SHA}
       - rustup default stable
-      - cargo build --release
+      - cargo build --locked --release
       # Upload to Gitea release
       - >-
         VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/') &&

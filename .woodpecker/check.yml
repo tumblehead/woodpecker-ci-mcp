@@ -17,5 +17,5 @@ steps:
       - git fetch --no-tags --depth=1 origin ${CI_COMMIT_SHA}
       - git reset --hard ${CI_COMMIT_SHA}
       - rustup default stable
-      - cargo clippy --all-targets -- -D warnings
-      - cargo test
+      - cargo clippy --locked --all-targets -- -D warnings
+      - cargo test --locked

@@ -25,7 +25,7 @@ steps:
       # Ensure cargo/rustup are in PATH (agent runs as SYSTEM)
       - $env:PATH = "$env:USERPROFILE\.cargo\bin;C:\Users\Administrator\.cargo\bin;$env:PATH"
       - rustup default stable
-      - cargo build --release
+      - cargo build --locked --release
       # Upload to Gitea release
       - >-
         $VERSION = (Select-String -Path Cargo.toml -Pattern '^version' | Select-Object -First 1).Line -replace '.*"(.*)".*','$1';
