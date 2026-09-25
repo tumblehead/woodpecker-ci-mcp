@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-25
+
 ### Changed
 - Upgraded rmcp 1.3 to 3.4, base64 0.22 to 0.23, and the other dependencies. Minimum Rust version is now 1.88.
 - Responses are now the Woodpecker server's own JSON (minus avatar URLs) instead of
@@ -65,6 +67,7 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 - `get_step_logs` handles `null` responses and decodes the base64 `data` field.
 
-[Unreleased]: http://10.100.36.15:3000/soren-n/woodpecker-ci-mcp/compare/v0.2.0...main
+[Unreleased]: http://10.100.36.15:3000/soren-n/woodpecker-ci-mcp/compare/v0.3.0...main
+[0.3.0]: http://10.100.36.15:3000/soren-n/woodpecker-ci-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: http://10.100.36.15:3000/soren-n/woodpecker-ci-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: http://10.100.36.15:3000/soren-n/woodpecker-ci-mcp/releases/tag/v0.1.0
