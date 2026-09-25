@@ -1,47 +1,96 @@
+use reqwest::Method;
 use rmcp::{
+    ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{
-        CallToolResult, Content, ErrorCode, ErrorData as McpError, ServerCapabilities, ServerInfo,
-    },
-    schemars, tool, tool_handler, tool_router, ServerHandler,
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
+    schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
-use std::borrow::Cow;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::client::WoodpeckerClient;
-use crate::models::*;
+use crate::client::{WoodpeckerClient, encode_segment};
+use crate::error::WoodpeckerError;
+use crate::logs::{self, LogWindow};
+use crate::models::{LogEntry, Pipeline};
+
+type ToolResult = Result<CallToolResult, WoodpeckerError>;
+
+/// Fields that only waste context for a model (image URLs).
+const NOISE: &[&str] = &["author_avatar", "avatar_url"];
+
+const INSTRUCTIONS: &str = "Woodpecker CI MCP server. Most tools take a numeric repo_id: \
+get it from lookup_repo (by 'owner/name') or list_repos. Pipelines are addressed by their \
+per-repo pipeline_number. To read a failing step's output, call list_pipeline_steps to find \
+the step_id, then get_step_logs (which returns the tail of long logs by default).";
 
 /// MCP Server for Woodpecker CI
 #[derive(Clone)]
 pub struct WoodpeckerMcpServer {
     client: Arc<WoodpeckerClient>,
-    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
-fn make_error(msg: String) -> McpError {
-    McpError {
-        code: ErrorCode::INTERNAL_ERROR,
-        message: Cow::from(msg),
-        data: None,
+fn text(s: impl Into<String>) -> CallToolResult {
+    CallToolResult::success(vec![ContentBlock::text(s)])
+}
+
+/// Return the server's JSON to the model, minus fields listed in `drop`.
+fn json_result(mut value: Value, drop: &[&str]) -> ToolResult {
+    strip_keys(&mut value, drop);
+    Ok(text(value.to_string()))
+}
+
+fn strip_keys(value: &mut Value, keys: &[&str]) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|k, _| !keys.contains(&k.as_str()));
+            map.values_mut().for_each(|v| strip_keys(v, keys));
+        }
+        Value::Array(items) => items.iter_mut().for_each(|v| strip_keys(v, keys)),
+        _ => {}
     }
 }
 
+/// Query string pairs from optional values, skipping the unset ones.
+fn query<const N: usize>(
+    pairs: [(&'static str, Option<String>); N],
+) -> Vec<(&'static str, String)> {
+    pairs
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|v| (k, v)))
+        .collect()
+}
+
+/// Endpoint prefix for secrets at global, org or repo level.
+fn secrets_path(repo_id: Option<i64>, org_id: Option<i64>) -> Result<String, WoodpeckerError> {
+    match (repo_id, org_id) {
+        (Some(_), Some(_)) => Err(WoodpeckerError::InvalidInput(
+            "Pass either repo_id or org_id, not both (omit both for global secrets)".into(),
+        )),
+        (Some(repo_id), None) => Ok(format!("/repos/{repo_id}/secrets")),
+        (None, Some(org_id)) => Ok(format!("/orgs/{org_id}/secrets")),
+        (None, None) => Ok("/secrets".into()),
+    }
+}
+
+const FILTERED: &str = "Woodpecker created no pipeline: it was filtered out. Either no pipeline \
+config was found on the branch, the commit message contains [skip ci], or no workflow's `when` \
+conditions match this event (a manually triggered pipeline has event 'manual').";
+
 // Request types for tools
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListReposRequest {
-    #[schemars(description = "Filter by active status (true/false)")]
-    pub active: Option<bool>,
-    #[schemars(description = "Page number (1-based)")]
-    pub page: Option<i32>,
-    #[schemars(description = "Items per page (default: 50)")]
-    pub per_page: Option<i32>,
+    #[schemars(description = "Include inactive repositories (default: only active ones)")]
+    pub all: Option<bool>,
+    #[schemars(description = "Only return repositories whose name contains this string")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct GetRepoRequest {
+pub struct RepoRequest {
     #[schemars(description = "Repository ID")]
     pub repo_id: i64,
 }
@@ -58,18 +107,31 @@ pub struct ListPipelinesRequest {
     pub repo_id: i64,
     #[schemars(description = "Filter by branch name")]
     pub branch: Option<String>,
-    #[schemars(description = "Filter by event type (push, pull_request, tag, etc.)")]
+    #[schemars(
+        description = "Filter by event, comma separated: push, pull_request, pull_request_closed, pull_request_metadata, tag, release, deployment, cron, manual"
+    )]
     pub event: Option<String>,
-    #[schemars(description = "Filter by status (success, failure, pending, running, etc.)")]
+    #[schemars(
+        description = "Filter by status: pending, running, success, failure, killed, error, blocked, declined, skipped, canceled"
+    )]
     pub status: Option<String>,
+    #[schemars(
+        description = "Only pipelines whose git ref contains this string (e.g. 'refs/tags/v1')"
+    )]
+    #[serde(rename = "ref")]
+    pub git_ref: Option<String>,
+    #[schemars(description = "Only pipelines created before this RFC 3339 timestamp")]
+    pub before: Option<String>,
+    #[schemars(description = "Only pipelines created after this RFC 3339 timestamp")]
+    pub after: Option<String>,
     #[schemars(description = "Page number (1-based)")]
-    pub page: Option<i32>,
+    pub page: Option<u32>,
     #[schemars(description = "Items per page (default: 50)")]
-    pub per_page: Option<i32>,
+    pub per_page: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct GetPipelineRequest {
+pub struct PipelineRequest {
     #[schemars(description = "Repository ID")]
     pub repo_id: i64,
     #[schemars(description = "Pipeline number")]
@@ -82,16 +144,8 @@ pub struct CreatePipelineRequest {
     pub repo_id: i64,
     #[schemars(description = "Branch name to build")]
     pub branch: String,
-    #[schemars(description = "Optional variables as key-value pairs")]
+    #[schemars(description = "Optional pipeline variables as key-value pairs")]
     pub variables: Option<HashMap<String, String>>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PipelineActionRequest {
-    #[schemars(description = "Repository ID")]
-    pub repo_id: i64,
-    #[schemars(description = "Pipeline number")]
-    pub pipeline_number: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -103,65 +157,71 @@ pub struct GetStepLogsRequest {
     #[schemars(description = "Step ID to get logs for (use list_pipeline_steps to find step IDs)")]
     pub step_id: i64,
     #[schemars(
-        description = "Number of lines to return. Combined with 'head': if head is true, returns this many lines from the start; otherwise from the end (tail). Ignored if offset or limit is set."
+        description = "Number of lines to return: from the start if 'head' is true, otherwise from the end. Ignored if offset or limit is set."
     )]
     pub lines: Option<usize>,
-    #[schemars(
-        description = "If true, return lines from the start of the log. If false or omitted, return lines from the end (tail). Only used with the 'lines' parameter."
-    )]
+    #[schemars(description = "With 'lines': take lines from the start instead of the end")]
     pub head: Option<bool>,
     #[schemars(
-        description = "Zero-based line offset for pagination. When set, enables pagination mode (ignores 'lines' and 'head' parameters)."
+        description = "Zero-based line offset for pagination. Setting offset or limit enables pagination mode (ignores 'lines' and 'head')."
     )]
     pub offset: Option<usize>,
-    #[schemars(
-        description = "Maximum number of lines to return for pagination. Defaults to 100 when offset is set. When set, enables pagination mode (ignores 'lines' and 'head' parameters)."
-    )]
+    #[schemars(description = "Maximum lines per page in pagination mode (default: 100)")]
     pub limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ListStepsRequest {
-    #[schemars(description = "Repository ID")]
-    pub repo_id: i64,
-    #[schemars(description = "Pipeline number")]
-    pub pipeline_number: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListSecretsRequest {
     #[schemars(description = "Repository ID (for repo secrets)")]
     pub repo_id: Option<i64>,
-    #[schemars(description = "Organization ID (for org secrets)")]
+    #[schemars(
+        description = "Organization ID (for org secrets). Omit both IDs for global secrets."
+    )]
     pub org_id: Option<i64>,
     #[schemars(description = "Page number (1-based)")]
-    pub page: Option<i32>,
-    #[schemars(description = "Items per page")]
-    pub per_page: Option<i32>,
+    pub page: Option<u32>,
+    #[schemars(description = "Items per page (default: 50)")]
+    pub per_page: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateSecretRequest {
     #[schemars(description = "Repository ID (for repo secrets)")]
     pub repo_id: Option<i64>,
-    #[schemars(description = "Organization ID (for org secrets)")]
+    #[schemars(
+        description = "Organization ID (for org secrets). Omit both IDs for a global secret (admin only)."
+    )]
     pub org_id: Option<i64>,
     #[schemars(description = "Secret name")]
     pub name: String,
     #[schemars(description = "Secret value")]
     pub value: String,
-    #[schemars(description = "Events that can use this secret")]
-    pub events: Option<Vec<String>>,
+    #[schemars(
+        description = "Events whose pipelines may use this secret (at least one): push, pull_request, pull_request_closed, pull_request_metadata, tag, release, deployment, cron, manual"
+    )]
+    pub events: Vec<String>,
+    #[schemars(description = "Restrict the secret to these plugin images")]
+    pub images: Option<Vec<String>>,
+    #[schemars(description = "Free-text note describing the secret")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteSecretRequest {
     #[schemars(description = "Repository ID (for repo secrets)")]
     pub repo_id: Option<i64>,
-    #[schemars(description = "Organization ID (for org secrets)")]
+    #[schemars(
+        description = "Organization ID (for org secrets). Omit both IDs for a global secret (admin only)."
+    )]
     pub org_id: Option<i64>,
     #[schemars(description = "Secret name")]
     pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UserFeedRequest {
+    #[schemars(description = "Only return the latest pipeline of each repository")]
+    pub latest: Option<bool>,
 }
 
 #[tool_router]
@@ -173,514 +233,470 @@ impl WoodpeckerMcpServer {
         }
     }
 
+    async fn get_json(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Value, WoodpeckerError> {
+        self.client
+            .send(self.client.api(Method::GET, path).query(query))
+            .await?
+            .json()
+    }
+
+    /// POST a pipeline action that returns the resulting pipeline (or 204 when filtered).
+    async fn pipeline_action(&self, path: String) -> ToolResult {
+        let reply = self
+            .client
+            .send(self.client.api(Method::POST, &path))
+            .await?;
+        match reply.json_opt()? {
+            Some(pipeline) => json_result(pipeline, NOISE),
+            None => Ok(text(FILTERED)),
+        }
+    }
+
     // ===== System Tools =====
 
-    #[tool(description = "Get Woodpecker CI server version and build information")]
-    async fn get_server_version(&self) -> Result<CallToolResult, McpError> {
-        // /version is a root-level system endpoint (no /api prefix)
-        let version: VersionInfo = self
+    #[tool(
+        description = "Get Woodpecker CI server version and build information",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_server_version(&self) -> ToolResult {
+        let reply = self
             .client
-            .get_root("/version")
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json = serde_json::to_string_pretty(&version).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+            .send(self.client.root(Method::GET, "/version"))
+            .await?;
+        json_result(reply.json()?, &[])
     }
 
-    #[tool(description = "Check if the Woodpecker CI server is healthy and responding")]
-    async fn health_check(&self) -> Result<CallToolResult, McpError> {
-        // /healthz is a root-level system endpoint (no /api prefix)
-        // It returns 204 No Content when healthy, not JSON
+    #[tool(
+        description = "Check if the Woodpecker CI server is healthy and responding",
+        annotations(read_only_hint = true)
+    )]
+    async fn health_check(&self) -> ToolResult {
         self.client
-            .get_root_text("/healthz")
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        Ok(CallToolResult::success(vec![Content::text(
-            r#"{"status": "healthy"}"#,
-        )]))
+            .send(self.client.root(Method::GET, "/healthz"))
+            .await?;
+        Ok(text(r#"{"status":"healthy"}"#))
     }
 
-    #[tool(description = "Get information about the pipeline queue")]
-    async fn get_queue_info(&self) -> Result<CallToolResult, McpError> {
-        let info: QueueInfo = self
-            .client
-            .get("/queue/info")
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json = serde_json::to_string_pretty(&info).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "Get pending, running and waiting tasks in the pipeline queue and agent worker counts (admin only)",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_queue_info(&self) -> ToolResult {
+        json_result(self.get_json("/queue/info", &[]).await?, &[])
     }
 
     // ===== Repository Tools =====
 
-    #[tool(description = "List all repositories accessible to the authenticated user")]
-    async fn list_repos(
-        &self,
-        Parameters(req): Parameters<ListReposRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let query = PaginationParams {
-            page: req.page,
-            per_page: req.per_page,
-        };
-
-        let endpoint = if let Some(active) = req.active {
-            format!("/repos?active={}", active)
-        } else {
-            "/repos".to_string()
-        };
-
-        let repos: Vec<Repository> = self
-            .client
-            .get_with_query(&endpoint, &query)
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json = serde_json::to_string_pretty(&repos).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "List repositories the authenticated user can access",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_repos(&self, Parameters(req): Parameters<ListReposRequest>) -> ToolResult {
+        let q = query([("all", req.all.map(|b| b.to_string())), ("name", req.name)]);
+        json_result(self.get_json("/user/repos", &q).await?, NOISE)
     }
 
-    #[tool(description = "Get detailed information about a specific repository by its ID")]
-    async fn get_repo(
-        &self,
-        Parameters(req): Parameters<GetRepoRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let repo: Repository = self
-            .client
-            .get(&format!("/repos/{}", req.repo_id))
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json = serde_json::to_string_pretty(&repo).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "Get detailed information about a specific repository by its ID",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_repo(&self, Parameters(req): Parameters<RepoRequest>) -> ToolResult {
+        let path = format!("/repos/{}", req.repo_id);
+        json_result(self.get_json(&path, &[]).await?, NOISE)
     }
 
-    #[tool(description = "Find a repository by its full name (owner/repo format)")]
-    async fn lookup_repo(
-        &self,
-        Parameters(req): Parameters<LookupRepoRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let repo: Repository = self
-            .client
-            .get(&format!("/repos/lookup/{}", req.full_name))
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json = serde_json::to_string_pretty(&repo).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "Find a repository by its full name (owner/repo format); returns its numeric ID among other details",
+        annotations(read_only_hint = true)
+    )]
+    async fn lookup_repo(&self, Parameters(req): Parameters<LookupRepoRequest>) -> ToolResult {
+        let full_name = req
+            .full_name
+            .trim()
+            .trim_matches('/')
+            .split('/')
+            .map(encode_segment)
+            .collect::<Vec<_>>()
+            .join("/");
+        let path = format!("/repos/lookup/{full_name}");
+        json_result(self.get_json(&path, &[]).await?, NOISE)
     }
 
     // ===== Pipeline Tools =====
 
-    #[tool(description = "List pipelines for a repository with optional filters")]
+    #[tool(
+        description = "List pipelines for a repository, newest first, with optional filters",
+        annotations(read_only_hint = true)
+    )]
     async fn list_pipelines(
         &self,
         Parameters(req): Parameters<ListPipelinesRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let query = PipelineFilter {
-            branch: req.branch,
-            event: req.event,
-            status: req.status,
-            page: req.page,
-            per_page: req.per_page,
-        };
-
-        let pipelines: Vec<Pipeline> = self
-            .client
-            .get_with_query(&format!("/repos/{}/pipelines", req.repo_id), &query)
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json =
-            serde_json::to_string_pretty(&pipelines).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    ) -> ToolResult {
+        let q = query([
+            ("branch", req.branch),
+            ("event", req.event),
+            ("status", req.status),
+            ("ref", req.git_ref),
+            ("before", req.before),
+            ("after", req.after),
+            ("page", req.page.map(|n| n.to_string())),
+            ("perPage", req.per_page.map(|n| n.to_string())),
+        ]);
+        let path = format!("/repos/{}/pipelines", req.repo_id);
+        let drop: Vec<&str> = NOISE.iter().copied().chain(["changed_files"]).collect();
+        json_result(self.get_json(&path, &q).await?, &drop)
     }
 
-    #[tool(description = "Get detailed information about a specific pipeline")]
-    async fn get_pipeline(
-        &self,
-        Parameters(req): Parameters<GetPipelineRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let pipeline: Pipeline = self
-            .client
-            .get(&format!(
-                "/repos/{}/pipelines/{}",
-                req.repo_id, req.pipeline_number
-            ))
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json =
-            serde_json::to_string_pretty(&pipeline).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "Get detailed information about a specific pipeline, including its workflows, steps and errors",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_pipeline(&self, Parameters(req): Parameters<PipelineRequest>) -> ToolResult {
+        let path = format!("/repos/{}/pipelines/{}", req.repo_id, req.pipeline_number);
+        json_result(self.get_json(&path, &[]).await?, NOISE)
     }
 
-    #[tool(description = "Trigger a new pipeline build on a specific branch")]
+    #[tool(
+        description = "Trigger a new pipeline (event 'manual') on the head of a branch",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
     async fn create_pipeline(
         &self,
         Parameters(req): Parameters<CreatePipelineRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let body = PipelineCreate {
-            branch: req.branch,
-            variables: req.variables.unwrap_or_default(),
+    ) -> ToolResult {
+        let body = json!({
+            "branch": req.branch,
+            "variables": req.variables.unwrap_or_default(),
+        });
+        let path = format!("/repos/{}/pipelines", req.repo_id);
+        let result = self
+            .client
+            .send(self.client.api(Method::POST, &path).json(&body))
+            .await;
+
+        let reply = match result {
+            // Woodpecker answers 500 without a body when it cannot resolve the branch head
+            Err(WoodpeckerError::Api {
+                request,
+                status: 500,
+                message,
+            }) => {
+                return Err(WoodpeckerError::Api {
+                    request,
+                    status: 500,
+                    message: format!("{message}. Check that branch '{}' exists.", req.branch),
+                });
+            }
+            other => other?,
         };
-
-        let pipeline: Pipeline = self
-            .client
-            .post(&format!("/repos/{}/pipelines", req.repo_id), &body)
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json =
-            serde_json::to_string_pretty(&pipeline).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        match reply.json_opt()? {
+            Some(pipeline) => json_result(pipeline, NOISE),
+            None => Ok(text(FILTERED)),
+        }
     }
 
-    #[tool(description = "Restart a previously completed or failed pipeline")]
-    async fn restart_pipeline(
-        &self,
-        Parameters(req): Parameters<PipelineActionRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let pipeline: Pipeline = self
-            .client
-            .post_empty(&format!(
-                "/repos/{}/pipelines/{}",
-                req.repo_id, req.pipeline_number
-            ))
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json =
-            serde_json::to_string_pretty(&pipeline).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "Restart a finished pipeline; creates a new pipeline with the same commit and config",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn restart_pipeline(&self, Parameters(req): Parameters<PipelineRequest>) -> ToolResult {
+        self.pipeline_action(format!(
+            "/repos/{}/pipelines/{}",
+            req.repo_id, req.pipeline_number
+        ))
+        .await
     }
 
-    #[tool(description = "Cancel a currently running pipeline")]
-    async fn cancel_pipeline(
-        &self,
-        Parameters(req): Parameters<PipelineActionRequest>,
-    ) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Cancel a pending or running pipeline",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        )
+    )]
+    async fn cancel_pipeline(&self, Parameters(req): Parameters<PipelineRequest>) -> ToolResult {
+        let path = format!(
+            "/repos/{}/pipelines/{}/cancel",
+            req.repo_id, req.pipeline_number
+        );
         self.client
-            .post_no_content(&format!(
-                "/repos/{}/pipelines/{}/cancel",
-                req.repo_id, req.pipeline_number
-            ))
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Pipeline {} cancelled successfully",
-            req.pipeline_number
-        ))]))
+            .send(self.client.api(Method::POST, &path))
+            .await?;
+        Ok(text(format!("Pipeline {} cancelled", req.pipeline_number)))
     }
 
-    #[tool(description = "Approve a gated pipeline waiting for manual approval")]
-    async fn approve_pipeline(
-        &self,
-        Parameters(req): Parameters<PipelineActionRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let pipeline: Pipeline = self
-            .client
-            .post_empty(&format!(
-                "/repos/{}/pipelines/{}/approve",
-                req.repo_id, req.pipeline_number
-            ))
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json =
-            serde_json::to_string_pretty(&pipeline).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "Approve a pipeline that is blocked waiting for manual approval",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    async fn approve_pipeline(&self, Parameters(req): Parameters<PipelineRequest>) -> ToolResult {
+        self.pipeline_action(format!(
+            "/repos/{}/pipelines/{}/approve",
+            req.repo_id, req.pipeline_number
+        ))
+        .await
     }
 
-    #[tool(description = "Decline a gated pipeline waiting for manual approval")]
-    async fn decline_pipeline(
-        &self,
-        Parameters(req): Parameters<PipelineActionRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let pipeline: Pipeline = self
-            .client
-            .post_empty(&format!(
-                "/repos/{}/pipelines/{}/decline",
-                req.repo_id, req.pipeline_number
-            ))
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json =
-            serde_json::to_string_pretty(&pipeline).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "Decline a pipeline that is blocked waiting for manual approval",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    async fn decline_pipeline(&self, Parameters(req): Parameters<PipelineRequest>) -> ToolResult {
+        self.pipeline_action(format!(
+            "/repos/{}/pipelines/{}/decline",
+            req.repo_id, req.pipeline_number
+        ))
+        .await
     }
 
     // ===== Log Tools =====
 
-    #[tool(description = "List all steps in a pipeline with their IDs, states, and names - useful for finding the correct step_id for get_step_logs")]
+    #[tool(
+        description = "List all steps in a pipeline with their IDs, states, exit codes, durations and errors - use this to find the step_id for get_step_logs",
+        annotations(read_only_hint = true)
+    )]
     async fn list_pipeline_steps(
         &self,
-        Parameters(req): Parameters<ListStepsRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let pipeline: Pipeline = self
+        Parameters(req): Parameters<PipelineRequest>,
+    ) -> ToolResult {
+        let path = format!("/repos/{}/pipelines/{}", req.repo_id, req.pipeline_number);
+        let reply = self
             .client
-            .get(&format!(
-                "/repos/{}/pipelines/{}",
-                req.repo_id, req.pipeline_number
-            ))
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let mut output = String::new();
-        output.push_str(&format!("Pipeline #{} Steps:\n\n", pipeline.number));
-
-        if let Some(workflows) = pipeline.workflows {
-            for workflow in workflows {
-                output.push_str(&format!(
-                    "Workflow: {} (state: {})\n",
-                    workflow.name,
-                    workflow.state.as_deref().unwrap_or("unknown")
-                ));
-
-                if let Some(steps) = workflow.children {
-                    for step in steps {
-                        output.push_str(&format!(
-                            "  - Step ID: {} | Name: {} | State: {} | Exit: {}\n",
-                            step.id,
-                            step.name,
-                            step.state.as_deref().unwrap_or("unknown"),
-                            step.exit_code
-                                .map(|c| c.to_string())
-                                .unwrap_or_else(|| "-".to_string())
-                        ));
-                    }
-                }
-                output.push('\n');
-            }
-        } else {
-            output.push_str("No workflows found in this pipeline.\n");
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+            .send(self.client.api(Method::GET, &path))
+            .await?;
+        Ok(text(render_steps(&reply.json()?)))
     }
 
     #[tool(
-        description = "Get the execution logs for a specific pipeline step. Supports head/tail (lines + head params) and pagination (offset + limit params). By default returns all lines. Output includes line numbers and metadata about the total log size."
+        description = "Get the output of a pipeline step, with line numbers. Returns the whole log, or the last 1000 lines when it is longer. Use lines+head for head/tail, or offset+limit to page through.",
+        annotations(read_only_hint = true)
     )]
-    async fn get_step_logs(
-        &self,
-        Parameters(req): Parameters<GetStepLogsRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let logs: Option<Vec<LogEntry>> = self
+    async fn get_step_logs(&self, Parameters(req): Parameters<GetStepLogsRequest>) -> ToolResult {
+        let path = format!(
+            "/repos/{}/logs/{}/{}",
+            req.repo_id, req.pipeline_number, req.step_id
+        );
+        let reply = self
             .client
-            .get_optional(&format!(
-                "/repos/{}/logs/{}/{}",
-                req.repo_id, req.pipeline_number, req.step_id
-            ))
-            .await
-            .map_err(|e| e.into_mcp_error())?;
+            .send(self.client.api(Method::GET, &path))
+            .await?;
+        let entries: Vec<LogEntry> = reply.json_opt()?.unwrap_or_default();
+        let lines = logs::decode(&entries);
 
-        match logs {
-            Some(entries) if !entries.is_empty() => {
-                use base64::Engine;
-
-                // Decode entries into (line_number, text) pairs
-                let decoded_lines: Vec<(usize, String)> = entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, entry)| {
-                        entry.data.as_ref().map(|d| {
-                            let text = base64::engine::general_purpose::STANDARD
-                                .decode(d)
-                                .ok()
-                                .and_then(|bytes| String::from_utf8(bytes).ok())
-                                .unwrap_or_else(|| d.clone());
-                            let line_num = entry.line.map(|l| l as usize).unwrap_or(i);
-                            (line_num, text)
-                        })
-                    })
-                    .collect();
-
-                let total = decoded_lines.len();
-
-                if total == 0 {
-                    let sample: String = entries
-                        .iter()
-                        .take(3)
-                        .map(|e| format!("{:?}", e))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Logs contain {} entries but no output text.\n\nSample entries:\n{}",
-                        entries.len(),
-                        sample
-                    ))]));
-                }
-
-                // Determine slice based on parameters
-                // Pagination mode (offset/limit) takes priority over head/tail mode (lines/head)
-                let slice: &[(usize, String)] =
-                    if req.offset.is_some() || req.limit.is_some() {
-                        let offset = req.offset.unwrap_or(0).min(total);
-                        let limit = req.limit.unwrap_or(100);
-                        let end = total.min(offset + limit);
-                        &decoded_lines[offset..end]
-                    } else if let Some(n) = req.lines {
-                        if req.head.unwrap_or(false) {
-                            &decoded_lines[..total.min(n)]
-                        } else {
-                            &decoded_lines[total.saturating_sub(n)..]
-                        }
-                    } else {
-                        &decoded_lines[..]
-                    };
-
-                // Format with metadata header and line numbers
-                let header = if slice.len() < total {
-                    let first = slice.first().map(|(n, _)| *n).unwrap_or(0);
-                    let last = slice.last().map(|(n, _)| *n).unwrap_or(0);
-                    format!("[Log lines {}-{} of {} total]\n\n", first, last, total)
-                } else {
-                    format!("[{} log lines total]\n\n", total)
-                };
-
-                let body: String = slice
-                    .iter()
-                    .map(|(num, text)| format!("{}: {}", num, text))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "{}{}",
-                    header, body
-                ))]))
-            }
-            Some(_) => Ok(CallToolResult::success(vec![Content::text(
-                "Step has no log entries. It may have been skipped or not yet run.",
-            )])),
-            None => Ok(CallToolResult::success(vec![Content::text(
-                "No logs found for this step. Verify the step_id exists in the pipeline (use list_pipeline_steps to find valid IDs).",
-            )])),
+        if lines.is_empty() {
+            return Ok(text(
+                "Step has no log output. It may have been skipped, not started yet, or its logs were deleted.",
+            ));
         }
+
+        let window = LogWindow {
+            lines: req.lines,
+            head: req.head.unwrap_or(false),
+            offset: req.offset,
+            limit: req.limit,
+        };
+        Ok(text(logs::render(&lines, window)))
     }
 
     // ===== Secret Tools =====
 
-    #[tool(description = "List secrets (global, org, or repo level based on parameters)")]
-    async fn list_secrets(
-        &self,
-        Parameters(req): Parameters<ListSecretsRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let query = PaginationParams {
-            page: req.page,
-            per_page: req.per_page,
-        };
-
-        let endpoint = if let Some(repo_id) = req.repo_id {
-            format!("/repos/{}/secrets", repo_id)
-        } else if let Some(org_id) = req.org_id {
-            format!("/orgs/{}/secrets", org_id)
-        } else {
-            "/secrets".to_string()
-        };
-
-        let secrets: Vec<Secret> = self
-            .client
-            .get_with_query(&endpoint, &query)
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json = serde_json::to_string_pretty(&secrets).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "List secrets (names and settings, never values) at global, org, or repo level",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_secrets(&self, Parameters(req): Parameters<ListSecretsRequest>) -> ToolResult {
+        let q = query([
+            ("page", req.page.map(|n| n.to_string())),
+            ("perPage", req.per_page.map(|n| n.to_string())),
+        ]);
+        let path = secrets_path(req.repo_id, req.org_id)?;
+        json_result(self.get_json(&path, &q).await?, &[])
     }
 
-    #[tool(description = "Create a new secret (global, org, or repo level based on parameters)")]
-    async fn create_secret(
-        &self,
-        Parameters(req): Parameters<CreateSecretRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let body = SecretCreate {
-            name: req.name,
-            value: req.value,
-            events: req.events,
-            images: None,
-        };
-
-        let endpoint = if let Some(repo_id) = req.repo_id {
-            format!("/repos/{}/secrets", repo_id)
-        } else if let Some(org_id) = req.org_id {
-            format!("/orgs/{}/secrets", org_id)
-        } else {
-            "/secrets".to_string()
-        };
-
-        let secret: Secret = self
+    #[tool(
+        description = "Create a new secret at global, org, or repo level",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn create_secret(&self, Parameters(req): Parameters<CreateSecretRequest>) -> ToolResult {
+        let path = secrets_path(req.repo_id, req.org_id)?;
+        let body = json!({
+            "name": req.name,
+            "value": req.value,
+            "events": req.events,
+            "images": req.images.unwrap_or_default(),
+            "note": req.note.unwrap_or_default(),
+        });
+        let reply = self
             .client
-            .post(&endpoint, &body)
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json = serde_json::to_string_pretty(&secret).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+            .send(self.client.api(Method::POST, &path).json(&body))
+            .await?;
+        json_result(reply.json()?, &["value"])
     }
 
-    #[tool(description = "Delete a secret (global, org, or repo level based on parameters)")]
-    async fn delete_secret(
-        &self,
-        Parameters(req): Parameters<DeleteSecretRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let endpoint = if let Some(repo_id) = req.repo_id {
-            format!("/repos/{}/secrets/{}", repo_id, req.name)
-        } else if let Some(org_id) = req.org_id {
-            format!("/orgs/{}/secrets/{}", org_id, req.name)
-        } else {
-            format!("/secrets/{}", req.name)
-        };
-
+    #[tool(
+        description = "Delete a secret at global, org, or repo level",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        )
+    )]
+    async fn delete_secret(&self, Parameters(req): Parameters<DeleteSecretRequest>) -> ToolResult {
+        let path = format!(
+            "{}/{}",
+            secrets_path(req.repo_id, req.org_id)?,
+            encode_segment(&req.name)
+        );
         self.client
-            .delete(&endpoint)
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Secret '{}' deleted successfully",
-            req.name
-        ))]))
+            .send(self.client.api(Method::DELETE, &path))
+            .await?;
+        Ok(text(format!("Secret '{}' deleted", req.name)))
     }
 
     // ===== User Tools =====
 
-    #[tool(description = "Get information about the currently authenticated user")]
-    async fn get_current_user(&self) -> Result<CallToolResult, McpError> {
-        let user: User = self
-            .client
-            .get("/user")
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json = serde_json::to_string_pretty(&user).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "Get information about the currently authenticated user",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_current_user(&self) -> ToolResult {
+        json_result(self.get_json("/user", &[]).await?, NOISE)
     }
 
-    #[tool(description = "Get the authenticated user's feed of recent pipelines")]
-    async fn get_user_feed(&self) -> Result<CallToolResult, McpError> {
-        let feed: Vec<FeedItem> = self
-            .client
-            .get("/user/feed")
-            .await
-            .map_err(|e| e.into_mcp_error())?;
-
-        let json = serde_json::to_string_pretty(&feed).map_err(|e| make_error(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    #[tool(
+        description = "Get recent pipelines across all repositories of the authenticated user",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_user_feed(&self, Parameters(req): Parameters<UserFeedRequest>) -> ToolResult {
+        let q = query([("latest", req.latest.map(|b| b.to_string()))]);
+        json_result(self.get_json("/user/feed", &q).await?, NOISE)
     }
 }
 
-#[tool_handler]
+/// Human-readable step overview for list_pipeline_steps.
+fn render_steps(pipeline: &Pipeline) -> String {
+    let mut out = format!("Pipeline #{} ({})\n", pipeline.number, pipeline.status);
+
+    for err in pipeline.errors.iter().flatten() {
+        let kind = if err.is_warning { "Warning" } else { "Error" };
+        out.push_str(&format!("{kind}: {}\n", err.message));
+    }
+
+    let workflows = pipeline.workflows.as_deref().unwrap_or_default();
+    if workflows.is_empty() {
+        out.push_str("\nNo workflows found in this pipeline.\n");
+    }
+
+    for workflow in workflows {
+        out.push_str(&format!(
+            "\nWorkflow: {} ({})\n",
+            workflow.name, workflow.state
+        ));
+        if !workflow.error.is_empty() {
+            out.push_str(&format!("  Error: {}\n", workflow.error));
+        }
+        for step in workflow.children.iter().flatten() {
+            out.push_str(&format!(
+                "  - step_id {} | {} | {}",
+                step.id, step.name, step.state
+            ));
+            if !step.step_type.is_empty() {
+                out.push_str(&format!(" | type {}", step.step_type));
+            }
+            if matches!(step.state.as_str(), "success" | "failure" | "killed") {
+                out.push_str(&format!(" | exit {}", step.exit_code));
+            }
+            if step.started > 0 && step.finished >= step.started {
+                out.push_str(&format!(" | {}s", step.finished - step.started));
+            }
+            if !step.error.is_empty() {
+                out.push_str(&format!(" | error: {}", step.error));
+            }
+            out.push('\n');
+        }
+    }
+
+    out.truncate(out.trim_end().len());
+    out
+}
+
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for WoodpeckerMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Woodpecker CI MCP Server - Interact with Woodpecker CI pipelines, \
-                 repositories, secrets, and more.",
-            )
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(INSTRUCTIONS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_noise_recursively() {
+        let mut v = json!([{"id": 1, "author_avatar": "x", "workflows": [{"avatar_url": "y", "name": "w"}]}]);
+        strip_keys(&mut v, NOISE);
+        assert_eq!(v, json!([{"id": 1, "workflows": [{"name": "w"}]}]));
+    }
+
+    #[test]
+    fn secrets_path_rejects_ambiguous_scope() {
+        assert_eq!(secrets_path(Some(1), None).unwrap(), "/repos/1/secrets");
+        assert_eq!(secrets_path(None, Some(2)).unwrap(), "/orgs/2/secrets");
+        assert_eq!(secrets_path(None, None).unwrap(), "/secrets");
+        assert!(secrets_path(Some(1), Some(2)).is_err());
+    }
+
+    /// Payload shape from a Woodpecker 3.x server: timestamps are `started`/`finished`,
+    /// pipeline errors are an `errors` array, and unknown fields must be tolerated.
+    #[test]
+    fn renders_steps_from_v3_payload() {
+        let pipeline: Pipeline = serde_json::from_value(json!({
+            "id": 10, "number": 42, "status": "failure", "forge_url": "https://x",
+            "errors": [{"type": "linter", "message": "deprecated key", "is_warning": true, "data": null}],
+            "workflows": [{
+                "id": 1, "pid": 1, "name": "check", "state": "failure",
+                "children": [
+                    {"id": 7, "pid": 2, "ppid": 1, "name": "clone", "state": "success", "exit_code": 0,
+                     "type": "clone", "started": 100, "finished": 103, "uuid": "u"},
+                    {"id": 8, "pid": 3, "ppid": 1, "name": "test", "state": "failure", "exit_code": 101,
+                     "type": "commands", "started": 103, "finished": 160, "error": "exit code 101"},
+                    {"id": 9, "pid": 4, "ppid": 1, "name": "publish", "state": "skipped", "exit_code": 0}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            render_steps(&pipeline),
+            "Pipeline #42 (failure)\n\
+             Warning: deprecated key\n\
+             \n\
+             Workflow: check (failure)\n  \
+             - step_id 7 | clone | success | type clone | exit 0 | 3s\n  \
+             - step_id 8 | test | failure | type commands | exit 101 | 57s | error: exit code 101\n  \
+             - step_id 9 | publish | skipped"
+        );
     }
 }

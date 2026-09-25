@@ -1,3 +1,3 @@
 mod woodpecker;
 
-pub use woodpecker::WoodpeckerClient;
+pub use woodpecker::{Reply, WoodpeckerClient, encode_segment};

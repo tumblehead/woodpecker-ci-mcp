@@ -1,263 +1,135 @@
-use reqwest::{Client, RequestBuilder, Response};
-use serde::{de::DeserializeOwned, Serialize};
+use std::fmt;
+use std::time::Duration;
+
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use reqwest::{Client, Method, RequestBuilder};
+use serde::de::DeserializeOwned;
 
 use crate::config::Config;
-use crate::error::{Result, WoodpeckerError};
+use crate::error::{Result, WoodpeckerError, truncate};
+
+/// Characters left unescaped in a path segment (RFC 3986 unreserved set).
+const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encode a user-supplied value for use as a single URL path segment.
+pub fn encode_segment(s: &str) -> String {
+    utf8_percent_encode(s, SEGMENT).to_string()
+}
 
 /// HTTP client wrapper for the Woodpecker CI API
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WoodpeckerClient {
-    client: Client,
-    /// Base URL for API endpoints (includes /api prefix)
-    base_url: String,
+    http: Client,
+    /// Server base URL without trailing slash (may include a root path)
+    base: String,
     token: String,
 }
 
+impl fmt::Debug for WoodpeckerClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WoodpeckerClient")
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A successful response body, tagged with the request that produced it.
+pub struct Reply {
+    request: String,
+    body: String,
+}
+
+impl Reply {
+    /// Whether the server returned no content (empty body or JSON `null`).
+    pub fn is_empty(&self) -> bool {
+        matches!(self.body.trim(), "" | "null")
+    }
+
+    /// Decode the body as JSON.
+    pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_str(&self.body).map_err(|e| WoodpeckerError::Decode {
+            request: self.request.clone(),
+            message: format!("{e}. Body: {}", truncate(&self.body, 500)),
+        })
+    }
+
+    /// Decode the body as JSON, treating an empty body or `null` as `None`.
+    pub fn json_opt<T: DeserializeOwned>(&self) -> Result<Option<T>> {
+        if self.is_empty() {
+            Ok(None)
+        } else {
+            self.json().map(Some)
+        }
+    }
+}
+
 impl WoodpeckerClient {
-    /// Create a new Woodpecker API client
     pub fn new(config: &Config) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(WoodpeckerError::HttpError)?;
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .build()?;
 
         Ok(Self {
-            client,
-            base_url: config.api_url(),
+            http,
+            base: config.server_url.as_str().trim_end_matches('/').to_string(),
             token: config.token.clone(),
         })
     }
 
-    /// Add authorization header to request
-    fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
-        request.bearer_auth(&self.token)
+    /// Build a request to an `/api` endpoint. `path` must start with `/` and
+    /// any user-supplied segments must already be passed through [`encode_segment`].
+    pub fn api(&self, method: Method, path: &str) -> RequestBuilder {
+        self.http
+            .request(method, format!("{}/api{}", self.base, path))
     }
 
-    /// Build full URL for an endpoint
-    fn url(&self, endpoint: &str) -> String {
-        format!("{}{}", self.base_url, endpoint)
+    /// Build a request to a root-level system endpoint such as `/version` or `/healthz`.
+    pub fn root(&self, method: Method, path: &str) -> RequestBuilder {
+        self.http.request(method, format!("{}{}", self.base, path))
     }
 
-    /// Handle response and convert errors
-    async fn handle_response<T: DeserializeOwned>(&self, response: Response) -> Result<T> {
-        let status = response.status().as_u16();
+    /// Authorize and send a request, turning non-2xx responses into errors.
+    pub async fn send(&self, request: RequestBuilder) -> Result<Reply> {
+        let request = request.bearer_auth(&self.token).build()?;
+        let label = format!("{} {}", request.method(), request.url().path());
+        tracing::debug!("{label}");
 
-        if (200..300).contains(&status) {
-            let body = response.text().await.map_err(WoodpeckerError::HttpError)?;
-            serde_json::from_str(&body).map_err(|e| {
-                WoodpeckerError::Other(format!(
-                    "Failed to parse response: {}. Body: {}",
-                    e,
-                    if body.len() > 500 { &body[..500] } else { &body }
-                ))
+        let response = self.http.execute(request).await?;
+        let status = response.status();
+        let body = response.text().await?;
+
+        if status.is_success() {
+            Ok(Reply {
+                request: label,
+                body,
             })
         } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(WoodpeckerError::from_response(status, body))
+            Err(WoodpeckerError::from_response(
+                label,
+                status.as_u16(),
+                &body,
+            ))
         }
     }
+}
 
-    /// Handle response that returns plain text or empty body
-    async fn handle_text_response(&self, response: Response) -> Result<String> {
-        let status = response.status().as_u16();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        if (200..300).contains(&status) {
-            response.text().await.map_err(WoodpeckerError::HttpError)
-        } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(WoodpeckerError::from_response(status, body))
-        }
-    }
-
-    /// Handle response for endpoints that return no content
-    async fn handle_empty_response(&self, response: Response) -> Result<()> {
-        let status = response.status().as_u16();
-
-        if (200..300).contains(&status) {
-            Ok(())
-        } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(WoodpeckerError::from_response(status, body))
-        }
-    }
-
-    /// GET request
-    pub async fn get<T: DeserializeOwned>(&self, endpoint: &str) -> Result<T> {
-        let response = self
-            .authorize(self.client.get(self.url(endpoint)))
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_response(response).await
-    }
-
-    /// GET request that may return null (treated as None)
-    pub async fn get_optional<T: DeserializeOwned>(&self, endpoint: &str) -> Result<Option<T>> {
-        let response = self
-            .authorize(self.client.get(self.url(endpoint)))
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        let status = response.status().as_u16();
-
-        if (200..300).contains(&status) {
-            let body = response.text().await.map_err(WoodpeckerError::HttpError)?;
-            if body.trim() == "null" || body.trim().is_empty() {
-                Ok(None)
-            } else {
-                serde_json::from_str(&body)
-                    .map(Some)
-                    .map_err(|e| {
-                        WoodpeckerError::Other(format!(
-                            "Failed to parse response: {}. Body: {}",
-                            e,
-                            if body.len() > 500 { &body[..500] } else { &body }
-                        ))
-                    })
-            }
-        } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(WoodpeckerError::from_response(status, body))
-        }
-    }
-
-    /// GET request with query parameters
-    pub async fn get_with_query<T: DeserializeOwned, Q: Serialize>(
-        &self,
-        endpoint: &str,
-        query: &Q,
-    ) -> Result<T> {
-        let response = self
-            .authorize(self.client.get(self.url(endpoint)))
-            .query(query)
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_response(response).await
-    }
-
-    /// GET request that returns plain text or empty body
-    pub async fn get_text(&self, endpoint: &str) -> Result<String> {
-        let response = self
-            .authorize(self.client.get(self.url(endpoint)))
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_text_response(response).await
-    }
-
-    /// GET request to root-level endpoint (bypasses /api prefix)
-    /// Used for system endpoints like /version and /healthz
-    pub async fn get_root<T: DeserializeOwned>(&self, endpoint: &str) -> Result<T> {
-        // Extract server URL by removing /api suffix from base_url
-        let server_url = self.base_url.trim_end_matches("/api");
-        let url = format!("{}{}", server_url, endpoint);
-
-        let response = self
-            .authorize(self.client.get(&url))
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_response(response).await
-    }
-
-    /// GET root-level endpoint that returns plain text
-    /// Used for system endpoints like /healthz that return non-JSON
-    pub async fn get_root_text(&self, endpoint: &str) -> Result<String> {
-        let server_url = self.base_url.trim_end_matches("/api");
-        let url = format!("{}{}", server_url, endpoint);
-
-        let response = self
-            .authorize(self.client.get(&url))
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_text_response(response).await
-    }
-
-    /// POST request with JSON body
-    pub async fn post<T: DeserializeOwned, B: Serialize>(
-        &self,
-        endpoint: &str,
-        body: &B,
-    ) -> Result<T> {
-        let url = self.url(endpoint);
-        let body_json = serde_json::to_string(body).unwrap_or_default();
-        tracing::debug!("POST {} with body: {}", url, body_json);
-
-        let response = self
-            .authorize(self.client.post(&url))
-            .json(body)
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_response(response).await
-    }
-
-    /// POST request without body
-    pub async fn post_empty<T: DeserializeOwned>(&self, endpoint: &str) -> Result<T> {
-        let response = self
-            .authorize(self.client.post(self.url(endpoint)))
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_response(response).await
-    }
-
-    /// POST request that returns no content
-    pub async fn post_no_content(&self, endpoint: &str) -> Result<()> {
-        let response = self
-            .authorize(self.client.post(self.url(endpoint)))
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_empty_response(response).await
-    }
-
-    /// PATCH request with JSON body
-    pub async fn patch<T: DeserializeOwned, B: Serialize>(
-        &self,
-        endpoint: &str,
-        body: &B,
-    ) -> Result<T> {
-        let response = self
-            .authorize(self.client.patch(self.url(endpoint)))
-            .json(body)
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_response(response).await
-    }
-
-    /// DELETE request
-    pub async fn delete(&self, endpoint: &str) -> Result<()> {
-        let response = self
-            .authorize(self.client.delete(self.url(endpoint)))
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_empty_response(response).await
-    }
-
-    /// DELETE request that returns a response
-    pub async fn delete_with_response<T: DeserializeOwned>(&self, endpoint: &str) -> Result<T> {
-        let response = self
-            .authorize(self.client.delete(self.url(endpoint)))
-            .send()
-            .await
-            .map_err(WoodpeckerError::HttpError)?;
-
-        self.handle_response(response).await
+    #[test]
+    fn encodes_path_segments() {
+        assert_eq!(encode_segment("MY_SECRET-1.x"), "MY_SECRET-1.x");
+        assert_eq!(encode_segment("a/b c?"), "a%2Fb%20c%3F");
     }
 }

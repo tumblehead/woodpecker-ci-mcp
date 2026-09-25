@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use rmcp::{transport::stdio, ServiceExt};
+use rmcp::{ServiceExt, transport::stdio};
 use woodpecker_ci_mcp::{Config, WoodpeckerClient, WoodpeckerMcpServer};
 
 #[tokio::main]
