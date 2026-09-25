@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Release CI: uploading binaries to Gitea now goes through
+  `scripts/upload-release-asset.{sh,ps1}`, which fail with Gitea's HTTP status and
+  response body instead of hiding errors (such as a revoked token) behind `curl -sf ... || true`.
+
 ## [0.3.0] - 2026-09-25
 
 ### Changed
