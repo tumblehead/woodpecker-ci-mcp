@@ -72,7 +72,7 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 - `get_step_logs` handles `null` responses and decodes the base64 `data` field.
 
-[Unreleased]: http://10.100.36.15:3000/soren-n/woodpecker-ci-mcp/compare/v0.3.0...main
-[0.3.0]: http://10.100.36.15:3000/soren-n/woodpecker-ci-mcp/compare/v0.2.0...v0.3.0
-[0.2.0]: http://10.100.36.15:3000/soren-n/woodpecker-ci-mcp/compare/v0.1.0...v0.2.0
-[0.1.0]: http://10.100.36.15:3000/soren-n/woodpecker-ci-mcp/releases/tag/v0.1.0
+[Unreleased]: http://10.100.36.15:3000/tumblehead/woodpecker-ci-mcp/compare/v0.3.0...main
+[0.3.0]: http://10.100.36.15:3000/tumblehead/woodpecker-ci-mcp/compare/v0.2.0...v0.3.0
+[0.2.0]: http://10.100.36.15:3000/tumblehead/woodpecker-ci-mcp/compare/v0.1.0...v0.2.0
+[0.1.0]: http://10.100.36.15:3000/tumblehead/woodpecker-ci-mcp/releases/tag/v0.1.0
